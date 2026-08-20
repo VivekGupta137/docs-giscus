@@ -8,11 +8,32 @@ const { GoogleGenAI } = require("@google/genai");
 
 const ALLOWED_USER = "VivekGupta137";
 const MAX_DOC_CHARS = 12_000;
-const MODELS = (process.env.GEMINI_MODELS || "gemini-3.7-flash,gemini-3.6-flash,gemini-2.0-flash")
+const MODELS = (process.env.GEMINI_MODELS || "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash-lite")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 const DOCS_ROOT = process.env.DOCS_ROOT || path.join("private-site-code", "src", "content", "docs");
+const NOT_IN_PAGE = "NOT_IN_PAGE";
+
+const PAGE_INSTRUCTION = [
+  "You help Vivek Gupta with doubts on his sdeway.com notes.",
+  "Answer ONLY from the provided page markdown. Quote a short snippet and cite the section heading when it answers the question.",
+  `If the page does not contain the answer, reply with exactly ${NOT_IN_PAGE} and nothing else.`,
+].join(" ");
+
+const WEB_INSTRUCTION = [
+  "You help Vivek Gupta with doubts on his sdeway.com notes.",
+  "The provided page markdown does not contain the answer. Use Google Search.",
+  "Say that it is not on the page, then answer from the web and include source URLs.",
+  "Be concise. Use markdown. Do not invent commands or APIs.",
+].join(" ");
+
+const KNOWLEDGE_INSTRUCTION = [
+  "You help Vivek Gupta with doubts on his sdeway.com notes.",
+  "The provided page markdown does not contain the answer, and web search is unavailable.",
+  "Answer from your knowledge of the topic. Start by saying it is not on this notes page.",
+  "Be concise. Use markdown. Do not invent commands or APIs.",
+].join(" ");
 
 function isUnavailable(err) {
   const status = err?.status || err?.code;
@@ -29,6 +50,13 @@ function isSearchUnsupported(err) {
   const status = err?.status || err?.code;
   const msg = String(err?.message || err || "");
   return status === 400 || /INVALID_ARGUMENT|googleSearch|not supported/i.test(msg);
+}
+
+function isMissingFromPage(text) {
+  const t = String(text || "")
+    .trim()
+    .replace(/^`+|`+$/g, "");
+  return t === NOT_IN_PAGE || t.startsWith(`${NOT_IN_PAGE}\n`) || t.startsWith(`${NOT_IN_PAGE} `);
 }
 
 function webSourceLinks(response) {
@@ -53,30 +81,48 @@ async function generateOnce(ai, model, contents, config) {
   return { text, model, response };
 }
 
-async function generateWithFallback(ai, contents, config) {
+async function generateAnswer(ai, contents, baseConfig) {
   const errors = [];
 
   for (const model of MODELS) {
-    const withSearch = { ...config, tools: [{ googleSearch: {} }] };
     try {
-      console.log(`Trying Gemini model ${model} (with search)`);
-      return await generateOnce(ai, model, contents, withSearch);
+      console.log(`Trying Gemini model ${model} (page)`);
+      const page = await generateOnce(ai, model, contents, {
+        ...baseConfig,
+        systemInstruction: PAGE_INSTRUCTION,
+      });
+      if (!isMissingFromPage(page.text)) return { ...page, origin: "page" };
     } catch (err) {
-      console.warn(`${model} with search failed: ${err.message || err}`);
+      console.warn(`${model} page failed: ${err.message || err}`);
+      errors.push(`${model}+page: ${err.message || err}`);
+      if (!isUnavailable(err)) throw err;
+      continue;
+    }
+
+    try {
+      console.log(`Trying Gemini model ${model} (search)`);
+      const web = await generateOnce(ai, model, contents, {
+        ...baseConfig,
+        tools: [{ googleSearch: {} }],
+        systemInstruction: WEB_INSTRUCTION,
+      });
+      return { ...web, origin: "web" };
+    } catch (err) {
+      console.warn(`${model} search failed: ${err.message || err}`);
       errors.push(`${model}+search: ${err.message || err}`);
+      if (!isUnavailable(err) && !isSearchUnsupported(err)) throw err;
+    }
 
-      if (isSearchUnsupported(err)) {
-        try {
-          console.log(`Retrying ${model} without search`);
-          return await generateOnce(ai, model, contents, config);
-        } catch (retryErr) {
-          console.warn(`${model} without search failed: ${retryErr.message || retryErr}`);
-          errors.push(`${model}: ${retryErr.message || retryErr}`);
-          if (!isUnavailable(retryErr)) throw retryErr;
-          continue;
-        }
-      }
-
+    try {
+      console.log(`Trying Gemini model ${model} (knowledge)`);
+      const knowledge = await generateOnce(ai, model, contents, {
+        ...baseConfig,
+        systemInstruction: KNOWLEDGE_INSTRUCTION,
+      });
+      return { ...knowledge, origin: "knowledge" };
+    } catch (err) {
+      console.warn(`${model} knowledge failed: ${err.message || err}`);
+      errors.push(`${model}+knowledge: ${err.message || err}`);
       if (!isUnavailable(err)) throw err;
     }
   }
@@ -253,21 +299,16 @@ async function main() {
     commentBody,
   ].join("\n");
 
-  const { text: answer, model, response } = await generateWithFallback(ai, contents, {
+  const { text: answer, model, response, origin } = await generateAnswer(ai, contents, {
     temperature: 0.2,
     maxOutputTokens: 900,
-    systemInstruction: [
-      "You help Vivek Gupta with doubts on his sdeway.com notes.",
-      "Prefer the provided page markdown. If it answers the question, quote a short snippet and cite the section heading.",
-      "If the page does not contain the answer, use Google Search. Say that it is not on the page, then answer from the web and include source URLs.",
-      "Be concise. Use markdown. Do not invent commands or APIs.",
-    ].join(" "),
   });
 
-  const sources = webSourceLinks(response);
-  const footer = sources.length
-    ? `_Gemini \`${model}\` · \`${doc.file}\` · web_\n\n${sources.join(" · ")}`
-    : `_Gemini \`${model}\` · \`${doc.file}\`_`;
+  const sources = origin === "web" ? webSourceLinks(response) : [];
+  const originLabel = origin === "web" ? "web" : origin === "knowledge" ? "not on page" : null;
+  const footerBits = [`Gemini \`${model}\``, `\`${doc.file}\``];
+  if (originLabel) footerBits.push(originLabel);
+  const footer = `_${footerBits.join(" · ")}_${sources.length ? `\n\n${sources.join(" · ")}` : ""}`;
 
   await postReply(token, {
     discussionId,
@@ -275,7 +316,7 @@ async function main() {
     body: `${answer}\n\n---\n${footer}`,
   });
 
-  console.log(`Replied on ${doc.file} with ${model}${sources.length ? " + web" : ""}`);
+  console.log(`Replied on ${doc.file} with ${model} (${origin})`);
 }
 
 main().catch((err) => {
