@@ -1,0 +1,41 @@
+name: AI Giscus Reply
+on:
+  discussion_comment:
+    types: [created]
+
+jobs:
+  reply:
+    if: ${{ github.event.comment.user.login != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      discussions: write
+      contents: read
+      models: read # <-- This unlocks GitHub Models
+
+    steps:
+      - name: Checkout Public Repo
+        uses: actions/checkout@v4
+
+      - name: Checkout Private Content Repo
+        uses: actions/checkout@v4
+        with:
+          repository: VivekGupta137/vgblog
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: private-site-code
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install openai @actions/github
+
+      - name: Generate and Post AI Reply
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Used for both API and AI authentication
+          DISCUSSION_TITLE: ${{ github.event.discussion.title }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          DISCUSSION_ID: ${{ github.event.discussion.node_id }}
+          REPLY_TO_ID: ${{ github.event.comment.node_id }}
+        run: node ai-reply.js
