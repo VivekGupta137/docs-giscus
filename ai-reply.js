@@ -8,8 +8,42 @@ const { GoogleGenAI } = require("@google/genai");
 
 const ALLOWED_USER = "VivekGupta137";
 const MAX_DOC_CHARS = 12_000;
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.7-flash";
+const MODELS = (process.env.GEMINI_MODELS || "gemini-3.7-flash,gemini-3.6-flash,gemini-2.0-flash")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 const DOCS_ROOT = process.env.DOCS_ROOT || path.join("private-site-code", "src", "content", "docs");
+
+function isUnavailable(err) {
+  const status = err?.status || err?.code;
+  const msg = String(err?.message || err || "");
+  return (
+    status === 503 ||
+    status === 429 ||
+    status === 404 ||
+    /UNAVAILABLE|RESOURCE_EXHAUSTED|NOT_FOUND|high demand|no longer available/i.test(msg)
+  );
+}
+
+async function generateWithFallback(ai, contents, config) {
+  const errors = [];
+
+  for (const model of MODELS) {
+    try {
+      console.log(`Trying Gemini model ${model}`);
+      const response = await ai.models.generateContent({ model, contents, config });
+      const text = (response.text || "").trim();
+      if (!text) throw new Error("empty reply");
+      return { text, model };
+    } catch (err) {
+      console.warn(`${model} failed: ${err.message || err}`);
+      errors.push(`${model}: ${err.message || err}`);
+      if (!isUnavailable(err)) throw err;
+    }
+  }
+
+  throw new Error(`All Gemini models failed:\n${errors.join("\n")}`);
+}
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -138,7 +172,7 @@ async function main() {
 
   const token = requiredEnv("GITHUB_TOKEN");
   const geminiKey = requiredEnv("GEMINI_API_KEY");
-  console.log(`Using Gemini model ${MODEL}`);
+  console.log(`Gemini models: ${MODELS.join(" → ")}`);
   const discussionTitle = process.env.DISCUSSION_TITLE || "";
   const discussionBody = process.env.DISCUSSION_BODY || "";
   const commentBody = (process.env.COMMENT_BODY || "").trim();
@@ -168,42 +202,36 @@ async function main() {
 
   const excerpt = selectRelevantMarkdown(doc.markdown, commentBody);
   const ai = new GoogleGenAI({ apiKey: geminiKey });
+  const contents = [
+    `Page path: /${pathname}/`,
+    `Source file: ${doc.file}`,
+    `Discussion title: ${discussionTitle}`,
+    "",
+    "## Page markdown",
+    excerpt,
+    "",
+    "## Question",
+    commentBody,
+  ].join("\n");
 
-  const response = await ai.models.generateContent({
-    model: MODEL,
-    contents: [
-      `Page path: /${pathname}/`,
-      `Source file: ${doc.file}`,
-      `Discussion title: ${discussionTitle}`,
-      "",
-      "## Page markdown",
-      excerpt,
-      "",
-      "## Question",
-      commentBody,
-    ].join("\n"),
-    config: {
-      temperature: 0.2,
-      maxOutputTokens: 700,
-      systemInstruction: [
-        "You help Vivek Gupta with doubts on his sdeway.com notes.",
-        "Answer ONLY from the provided page markdown. If it is not in the page, say so and suggest where on the page to look.",
-        "Be concise. Use markdown. Quote short snippets when useful.",
-        "Do not invent APIs, files, or steps that are not in the page.",
-      ].join(" "),
-    },
+  const { text: answer, model } = await generateWithFallback(ai, contents, {
+    temperature: 0.2,
+    maxOutputTokens: 700,
+    systemInstruction: [
+      "You help Vivek Gupta with doubts on his sdeway.com notes.",
+      "Answer ONLY from the provided page markdown. If it is not in the page, say so and suggest where on the page to look.",
+      "Be concise. Use markdown. Quote short snippets when useful.",
+      "Do not invent APIs, files, or steps that are not in the page.",
+    ].join(" "),
   });
-
-  const answer = (response.text || "").trim();
-  if (!answer) throw new Error("Gemini returned an empty reply");
 
   await postReply(token, {
     discussionId,
     replyToId,
-    body: `${answer}\n\n---\n_Answered from \`${doc.file}\`._`,
+    body: `${answer}\n\n---\n_Gemini \`${model}\` · \`${doc.file}\`_`,
   });
 
-  console.log(`Replied on ${doc.file}`);
+  console.log(`Replied on ${doc.file} with ${model}`);
 }
 
 main().catch((err) => {
