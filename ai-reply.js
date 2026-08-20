@@ -8,7 +8,7 @@ const { GoogleGenAI } = require("@google/genai");
 
 const ALLOWED_USER = "VivekGupta137";
 const MAX_DOC_CHARS = 12_000;
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.7-flash";
 const DOCS_ROOT = process.env.DOCS_ROOT || path.join("private-site-code", "src", "content", "docs");
 
 function requiredEnv(name) {
@@ -138,6 +138,7 @@ async function main() {
 
   const token = requiredEnv("GITHUB_TOKEN");
   const geminiKey = requiredEnv("GEMINI_API_KEY");
+  console.log(`Using Gemini model ${MODEL}`);
   const discussionTitle = process.env.DISCUSSION_TITLE || "";
   const discussionBody = process.env.DISCUSSION_BODY || "";
   const commentBody = (process.env.COMMENT_BODY || "").trim();
