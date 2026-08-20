@@ -5,7 +5,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { GoogleGenAI } = require("@google/genai");
-const github = require("@actions/github");
 
 const ALLOWED_USER = "VivekGupta137";
 const MAX_DOC_CHARS = 12_000;
@@ -102,23 +101,36 @@ function selectRelevantMarkdown(markdown, question) {
   return (out || body.slice(0, MAX_DOC_CHARS)).trim();
 }
 
-async function postReply(octokit, { discussionId, replyToId, body }) {
-  await octokit.graphql(
-    `mutation ($discussionId: ID!, $body: String!, $replyToId: ID) {
-      addDiscussionComment(input: {
-        discussionId: $discussionId
-        body: $body
-        replyToId: $replyToId
-      }) {
-        comment { id }
-      }
-    }`,
-    { discussionId, body, replyToId },
-  );
+async function postReply(token, { discussionId, replyToId, body }) {
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "User-Agent": "ai-giscus-reply",
+    },
+    body: JSON.stringify({
+      query: `mutation ($discussionId: ID!, $body: String!, $replyToId: ID) {
+        addDiscussionComment(input: {
+          discussionId: $discussionId
+          body: $body
+          replyToId: $replyToId
+        }) {
+          comment { id }
+        }
+      }`,
+      variables: { discussionId, body, replyToId },
+    }),
+  });
+
+  const json = await res.json();
+  if (!res.ok || json.errors) {
+    throw new Error(`GitHub GraphQL failed: ${JSON.stringify(json.errors || json)}`);
+  }
 }
 
 async function main() {
-  const commentUser = process.env.COMMENT_USER || github.context.payload.comment?.user?.login;
+  const commentUser = process.env.COMMENT_USER || "";
   if (commentUser !== ALLOWED_USER) {
     console.log(`Skip: user "${commentUser}" is not ${ALLOWED_USER}`);
     return;
@@ -126,11 +138,11 @@ async function main() {
 
   const token = requiredEnv("GITHUB_TOKEN");
   const geminiKey = requiredEnv("GEMINI_API_KEY");
-  const discussionTitle = process.env.DISCUSSION_TITLE || github.context.payload.discussion?.title || "";
-  const discussionBody = process.env.DISCUSSION_BODY || github.context.payload.discussion?.body || "";
-  const commentBody = (process.env.COMMENT_BODY || github.context.payload.comment?.body || "").trim();
-  const discussionId = process.env.DISCUSSION_ID || github.context.payload.discussion?.node_id;
-  const replyToId = process.env.REPLY_TO_ID || github.context.payload.comment?.node_id;
+  const discussionTitle = process.env.DISCUSSION_TITLE || "";
+  const discussionBody = process.env.DISCUSSION_BODY || "";
+  const commentBody = (process.env.COMMENT_BODY || "").trim();
+  const discussionId = process.env.DISCUSSION_ID;
+  const replyToId = process.env.REPLY_TO_ID;
 
   if (!commentBody) {
     console.log("Skip: empty comment");
@@ -142,11 +154,10 @@ async function main() {
 
   const pathname = pathnameFromDiscussion(discussionTitle, discussionBody);
   const doc = readDoc(pathname);
-  const octokit = github.getOctokit(token);
 
   if (!doc) {
     console.log(`No markdown for pathname "${pathname}"`);
-    await postReply(octokit, {
+    await postReply(token, {
       discussionId,
       replyToId,
       body: `_AI helper: could not find a docs page for \`${pathname || discussionTitle}\`._`,
@@ -185,7 +196,7 @@ async function main() {
   const answer = (response.text || "").trim();
   if (!answer) throw new Error("Gemini returned an empty reply");
 
-  await postReply(octokit, {
+  await postReply(token, {
     discussionId,
     replyToId,
     body: `${answer}\n\n---\n_Answered from \`${doc.file}\`._`,
