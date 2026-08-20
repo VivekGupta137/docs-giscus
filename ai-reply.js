@@ -25,19 +25,58 @@ function isUnavailable(err) {
   );
 }
 
+function isSearchUnsupported(err) {
+  const status = err?.status || err?.code;
+  const msg = String(err?.message || err || "");
+  return status === 400 || /INVALID_ARGUMENT|googleSearch|not supported/i.test(msg);
+}
+
+function webSourceLinks(response) {
+  const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+  const seen = new Set();
+  const links = [];
+  for (const chunk of chunks) {
+    const uri = chunk.web?.uri;
+    const title = (chunk.web?.title || uri || "").replace(/\|/g, " ");
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    links.push(`[${title}](${uri})`);
+    if (links.length >= 4) break;
+  }
+  return links;
+}
+
+async function generateOnce(ai, model, contents, config) {
+  const response = await ai.models.generateContent({ model, contents, config });
+  const text = (response.text || "").trim();
+  if (!text) throw new Error("empty reply");
+  return { text, model, response };
+}
+
 async function generateWithFallback(ai, contents, config) {
   const errors = [];
 
   for (const model of MODELS) {
+    const withSearch = { ...config, tools: [{ googleSearch: {} }] };
     try {
-      console.log(`Trying Gemini model ${model}`);
-      const response = await ai.models.generateContent({ model, contents, config });
-      const text = (response.text || "").trim();
-      if (!text) throw new Error("empty reply");
-      return { text, model };
+      console.log(`Trying Gemini model ${model} (with search)`);
+      return await generateOnce(ai, model, contents, withSearch);
     } catch (err) {
-      console.warn(`${model} failed: ${err.message || err}`);
-      errors.push(`${model}: ${err.message || err}`);
+      console.warn(`${model} with search failed: ${err.message || err}`);
+      errors.push(`${model}+search: ${err.message || err}`);
+
+      if (isSearchUnsupported(err)) {
+        try {
+          console.log(`Retrying ${model} without search`);
+          return await generateOnce(ai, model, contents, config);
+        } catch (retryErr) {
+          console.warn(`${model} without search failed: ${retryErr.message || retryErr}`);
+          errors.push(`${model}: ${retryErr.message || retryErr}`);
+          if (!isUnavailable(retryErr)) throw retryErr;
+          continue;
+        }
+      }
+
       if (!isUnavailable(err)) throw err;
     }
   }
@@ -214,24 +253,29 @@ async function main() {
     commentBody,
   ].join("\n");
 
-  const { text: answer, model } = await generateWithFallback(ai, contents, {
+  const { text: answer, model, response } = await generateWithFallback(ai, contents, {
     temperature: 0.2,
-    maxOutputTokens: 700,
+    maxOutputTokens: 900,
     systemInstruction: [
       "You help Vivek Gupta with doubts on his sdeway.com notes.",
-      "Answer ONLY from the provided page markdown. If it is not in the page, say so and suggest where on the page to look.",
-      "Be concise. Use markdown. Quote short snippets when useful.",
-      "Do not invent APIs, files, or steps that are not in the page.",
+      "Prefer the provided page markdown. If it answers the question, quote a short snippet and cite the section heading.",
+      "If the page does not contain the answer, use Google Search. Say that it is not on the page, then answer from the web and include source URLs.",
+      "Be concise. Use markdown. Do not invent commands or APIs.",
     ].join(" "),
   });
+
+  const sources = webSourceLinks(response);
+  const footer = sources.length
+    ? `_Gemini \`${model}\` · \`${doc.file}\` · web_\n\n${sources.join(" · ")}`
+    : `_Gemini \`${model}\` · \`${doc.file}\`_`;
 
   await postReply(token, {
     discussionId,
     replyToId,
-    body: `${answer}\n\n---\n_Gemini \`${model}\` · \`${doc.file}\`_`,
+    body: `${answer}\n\n---\n${footer}`,
   });
 
-  console.log(`Replied on ${doc.file} with ${model}`);
+  console.log(`Replied on ${doc.file} with ${model}${sources.length ? " + web" : ""}`);
 }
 
 main().catch((err) => {
