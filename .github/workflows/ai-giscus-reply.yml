@@ -1,41 +1,52 @@
+# Lives in VivekGupta137/docs-giscus (Giscus discussions).
+# Secrets:
+#   PRIVATE_REPO_PAT — PAT with contents:read on VivekGupta137/vgblog
+#   GEMINI_API_KEY   — Google AI Studio key (https://aistudio.google.com/apikey)
 name: AI Giscus Reply
+
 on:
   discussion_comment:
     types: [created]
 
 jobs:
   reply:
-    if: ${{ github.event.comment.user.login != 'github-actions[bot]' }}
+    if: ${{ github.event.comment.user.login == 'VivekGupta137' }}
     runs-on: ubuntu-latest
     permissions:
       discussions: write
       contents: read
-      models: read # <-- This unlocks GitHub Models
 
     steps:
-      - name: Checkout Public Repo
+      - name: Checkout Giscus repo
         uses: actions/checkout@v4
 
-      - name: Checkout Private Content Repo
+      - name: Checkout docs content
         uses: actions/checkout@v4
         with:
           repository: VivekGupta137/vgblog
           token: ${{ secrets.PRIVATE_REPO_PAT }}
+          ref: master
           path: private-site-code
+          sparse-checkout: |
+            src/content/docs
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install dependencies
-        run: npm install openai @actions/github
+        run: npm install @google/genai @actions/github
 
       - name: Generate and Post AI Reply
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Used for both API and AI authentication
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COMMENT_USER: ${{ github.event.comment.user.login }}
           DISCUSSION_TITLE: ${{ github.event.discussion.title }}
+          DISCUSSION_BODY: ${{ github.event.discussion.body }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           DISCUSSION_ID: ${{ github.event.discussion.node_id }}
           REPLY_TO_ID: ${{ github.event.comment.node_id }}
+          DOCS_ROOT: private-site-code/src/content/docs
         run: node ai-reply.js
